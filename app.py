@@ -2,13 +2,13 @@
 import os
 import logging
 import asyncio
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# NOTE: gradio_client is required (add to requirements.txt: gradio_client>=0.4.0)
+# require gradio_client in requirements (version can vary; this code is compatible with both hf_token and token names)
 from gradio_client import Client
 
 logging.basicConfig(level=logging.INFO)
@@ -16,14 +16,14 @@ logger = logging.getLogger("hf-space-proxy")
 
 # Config (set these in Render / locally)
 HF_SPACE = os.getenv("HF_SPACE", "weboffice/imartllm-v1-gpt")  # owner/repo
-HF_API_NAME = os.getenv("HF_API_NAME", "chat")                 # api name exposed by the Space (e.g. "/chat")
+HF_API_NAME = os.getenv("HF_API_NAME", "chat")                 # api name exposed by the Space (e.g. "chat" or "/chat")
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")                       # optional (private spaces)
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
 
-# CORS - adjust to your Vite dev URL and production origin
+# CORS - adjust to your frontend origin(s)
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "http://localhost:5173").split(",")
 
-app = FastAPI(title="HF Space Proxy (gradio_client)")
+app = FastAPI(title="HF Space Proxy (gradio_client robust)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,21 +48,47 @@ class ChatResponse(BaseModel):
     raw: Optional[dict] = None
 
 # ---------------------------
-# Gradio client (lazy singleton)
+# Gradio client (lazy singleton) with compatibility for different gradio_client versions
 # ---------------------------
 _gradio_client: Optional[Client] = None
 
 def get_gradio_client() -> Client:
+    """
+    Attempt to construct Client with the appropriate token kwarg depending on gradio_client version.
+    Tries hf_token, then token, then no token. Logs helpful info.
+    """
     global _gradio_client
-    if _gradio_client is None:
-        # Pass hf_token if provided (for private Spaces)
-        if HF_API_TOKEN:
-            logger.info("Creating gradio_client.Client for %s with token", HF_SPACE)
+    if _gradio_client is not None:
+        return _gradio_client
+
+    # Try hf_token first (older client versions), fallback to token (newer), else no-token
+    if HF_API_TOKEN:
+        try:
+            logger.info("Creating gradio_client.Client for %s using hf_token", HF_SPACE)
             _gradio_client = Client(HF_SPACE, hf_token=HF_API_TOKEN)
-        else:
-            logger.info("Creating gradio_client.Client for %s (no token)", HF_SPACE)
-            _gradio_client = Client(HF_SPACE)
-    return _gradio_client
+            return _gradio_client
+        except TypeError:
+            logger.info("hf_token not supported by installed gradio_client; trying 'token' kwarg")
+        except Exception as e:
+            logger.warning("Unexpected error constructing Client with hf_token: %s", e)
+
+        try:
+            logger.info("Creating gradio_client.Client for %s using token", HF_SPACE)
+            _gradio_client = Client(HF_SPACE, token=HF_API_TOKEN)
+            return _gradio_client
+        except TypeError:
+            logger.warning("token kwarg not supported either; falling back to no-token Client (may fail for private Spaces)")
+        except Exception as e:
+            logger.warning("Unexpected error constructing Client with token: %s", e)
+
+    # Last resort: instantiate without token
+    try:
+        logger.info("Creating gradio_client.Client for %s without token", HF_SPACE)
+        _gradio_client = Client(HF_SPACE)
+        return _gradio_client
+    except Exception as e:
+        logger.exception("Failed to construct gradio_client.Client: %s", e)
+        raise
 
 # ---------------------------
 # Health
@@ -72,18 +98,22 @@ async def health():
     return {"status": "ok"}
 
 # ---------------------------
-# Chat endpoint (uses gradio_client.predict)
+# Chat endpoint
 # ---------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     """
-    Calls the target Hugging Face Space using gradio_client.Client.predict
-    (this handles queued Jobs and returns the final output rather than an event_id).
-    The gradio_client.predict is a blocking call so we run it in a thread via asyncio.to_thread.
+    Uses gradio_client.Client.predict to call the HF Space API and waits (with timeout) for the final reply.
+    Runs the blocking predict in a thread via asyncio.to_thread and enforces REQUEST_TIMEOUT.
     """
-    client = get_gradio_client()
+    client = None
+    try:
+        client = get_gradio_client()
+    except Exception as e:
+        logger.exception("Could not initialize gradio client: %s", e)
+        raise HTTPException(status_code=500, detail="Server misconfiguration: failed to initialize gradio client")
 
-    # Prepare positional args in the same order the Space expects
+    # prepare positional args in same order the Space expects
     predict_args = (
         req.message,
         req.system_message or "You are a friendly Chatbot.",
@@ -92,37 +122,38 @@ async def chat_endpoint(req: ChatRequest):
         req.top_p or 0.95,
     )
 
+    api_name_clean = f"/{HF_API_NAME.lstrip('/')}"
+
     try:
-        # run blocking predict in a thread
-        result = await asyncio.to_thread(
-            client.predict,
-            *predict_args,
-            api_name=f"/{HF_API_NAME.lstrip('/')}",
+        # run blocking predict in a thread and enforce a timeout so requests don't hang indefinitely
+        result = await asyncio.wait_for(
+            asyncio.to_thread(client.predict, *predict_args, api_name=api_name_clean),
+            timeout=REQUEST_TIMEOUT,
         )
+    except asyncio.TimeoutError:
+        logger.warning("Upstream predict timed out after %s seconds", REQUEST_TIMEOUT)
+        raise HTTPException(status_code=504, detail="Upstream Space predict timed out")
     except Exception as e:
         logger.exception("Error calling gradio_client.predict: %s", e)
         raise HTTPException(status_code=502, detail=f"Failed to call upstream Space: {e}")
 
-    # result may be str, list, number, dict, etc. Try to extract a friendly 'reply'
+    # result can be many shapes; try to extract simple reply
     reply = None
-    raw_payload = {"result": result}
-
     if isinstance(result, (str, int, float)):
         reply = str(result)
     elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], (str, int, float)):
         reply = str(result[0])
-    else:
-        # If result is dict or complex structure, try to find a top-level string field
-        if isinstance(result, dict):
-            for k in ("response", "reply", "data", "output"):
-                if k in result and isinstance(result[k], (str, int, float)):
-                    reply = str(result[k])
-                    break
+    elif isinstance(result, dict):
+        # try common keys
+        for k in ("response", "reply", "data", "output", "result"):
+            if k in result and isinstance(result[k], (str, int, float)):
+                reply = str(result[k])
+                break
 
-    return ChatResponse(reply=reply, raw=raw_payload)
+    return ChatResponse(reply=reply, raw={"result": result})
 
 # ---------------------------
-# If run directly (useful for local dev)
+# Local dev runner
 # ---------------------------
 if __name__ == "__main__":
     import uvicorn
