@@ -1,0 +1,87 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+pip-wheel-metadata/
+
+# ===============================
+# Virtual Environments
+# ===============================
+.venv/
+venv/
+env/
+ENV/
+
+# ===============================
+# Environment / Secrets
+# ===============================
+.env
+.env.*
+*.env
+secrets.yaml
+*.secret
+*.key
+
+# ===============================
+# Jupyter / Notebooks
+# ===============================
+.ipynb_checkpoints/
+
+# ===============================
+# Gradio / Hugging Face Spaces
+# ===============================
+gradio_cached_examples/
+gradio_flagged/
+.gradio/
+
+# ===============================
+# Hugging Face Hub
+# ===============================
+.cache/
+hf_cache/
+huggingface_cache/
+
+# ===============================
+# Logs
+# ===============================
+*.log
+logs/
+*.out
+
+# ===============================
+# OS / Editor Files
+# ===============================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===============================
+# Testing / Coverage
+# ===============================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ===============================
+# Packaging
+# ===============================
+*.whl
+*.tar.gz
+
+# ===============================
+# Misc
+# ===============================
+*.bak
+*.tmp
