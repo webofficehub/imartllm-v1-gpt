@@ -1,25 +1,29 @@
+# app.py
 import os
 import logging
+import asyncio
 from typing import Optional
 
-import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# NOTE: gradio_client is required (add to requirements.txt: gradio_client>=0.4.0)
+from gradio_client import Client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hf-space-proxy")
 
 # Config (set these in Render / locally)
 HF_SPACE = os.getenv("HF_SPACE", "weboffice/imartllm-v1-gpt")  # owner/repo
-HF_API_NAME = os.getenv("HF_API_NAME", "chat")                # api name exposed by the Space
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")                      # optional (private spaces)
+HF_API_NAME = os.getenv("HF_API_NAME", "chat")                 # api name exposed by the Space (e.g. "/chat")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")                       # optional (private spaces)
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
 
 # CORS - adjust to your Vite dev URL and production origin
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "http://localhost:5173").split(",")
 
-app = FastAPI(title="HF Space Proxy")
+app = FastAPI(title="HF Space Proxy (gradio_client)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,25 +48,21 @@ class ChatResponse(BaseModel):
     raw: Optional[dict] = None
 
 # ---------------------------
-# Helpers
+# Gradio client (lazy singleton)
 # ---------------------------
-def space_base_url(space: str) -> str:
-    parts = space.split("/")
-    if len(parts) != 2:
-        raise ValueError("HF_SPACE must be 'owner/repo'")
-    owner, repo = parts
-    return f"https://{owner}-{repo}.hf.space"
+_gradio_client: Optional[Client] = None
 
-# Re-usable headers for HF Space calls
-def hf_headers():
-    h = {"Content-Type": "application/json"}
-    if HF_API_TOKEN:
-        h["Authorization"] = f"Bearer {HF_API_TOKEN}"
-    return h
-
-# Build gradio-style payload for Spaces
-def gradio_payload_for_chat(message: str, system_message: str, max_tokens: int, temperature: float, top_p: float):
-    return {"data": [message, system_message, max_tokens, temperature, top_p]}
+def get_gradio_client() -> Client:
+    global _gradio_client
+    if _gradio_client is None:
+        # Pass hf_token if provided (for private Spaces)
+        if HF_API_TOKEN:
+            logger.info("Creating gradio_client.Client for %s with token", HF_SPACE)
+            _gradio_client = Client(HF_SPACE, hf_token=HF_API_TOKEN)
+        else:
+            logger.info("Creating gradio_client.Client for %s (no token)", HF_SPACE)
+            _gradio_client = Client(HF_SPACE)
+    return _gradio_client
 
 # ---------------------------
 # Health
@@ -72,58 +72,54 @@ async def health():
     return {"status": "ok"}
 
 # ---------------------------
-# Existing chat endpoint (kept mostly as-is)
+# Chat endpoint (uses gradio_client.predict)
 # ---------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
-    base = space_base_url(HF_SPACE)
-    api_name_clean = HF_API_NAME.lstrip("/")
-    urls_to_try = [
-        f"{base}/gradio_api/call/{api_name_clean}",
-        f"{base}/run/{api_name_clean}",
-    ]
+    """
+    Calls the target Hugging Face Space using gradio_client.Client.predict
+    (this handles queued Jobs and returns the final output rather than an event_id).
+    The gradio_client.predict is a blocking call so we run it in a thread via asyncio.to_thread.
+    """
+    client = get_gradio_client()
 
-    payload = gradio_payload_for_chat(req.message, req.system_message, req.max_tokens, req.temperature, req.top_p)
-    last_exc = None
+    # Prepare positional args in the same order the Space expects
+    predict_args = (
+        req.message,
+        req.system_message or "You are a friendly Chatbot.",
+        req.max_tokens or 1024,
+        req.temperature or 0.7,
+        req.top_p or 0.95,
+    )
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        for url in urls_to_try:
-            try:
-                r = await client.post(url, json=payload, headers=hf_headers())
-            except httpx.RequestError as e:
-                last_exc = e
-                logger.warning("RequestError for %s: %s", url, e)
-                continue
+    try:
+        # run blocking predict in a thread
+        result = await asyncio.to_thread(
+            client.predict,
+            *predict_args,
+            api_name=f"/{HF_API_NAME.lstrip('/')}",
+        )
+    except Exception as e:
+        logger.exception("Error calling gradio_client.predict: %s", e)
+        raise HTTPException(status_code=502, detail=f"Failed to call upstream Space: {e}")
 
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    return ChatResponse(reply=r.text, raw={"status_code": r.status_code, "text": r.text})
+    # result may be str, list, number, dict, etc. Try to extract a friendly 'reply'
+    reply = None
+    raw_payload = {"result": result}
 
-                reply = None
-                if isinstance(data, dict) and "data" in data:
-                    arr = data["data"]
-                    if isinstance(arr, list) and len(arr) > 0:
-                        candidate = arr[0]
-                        if isinstance(candidate, (str, int, float)):
-                            reply = str(candidate)
-                else:
-                    if isinstance(data, (str, int, float)):
-                        reply = str(data)
+    if isinstance(result, (str, int, float)):
+        reply = str(result)
+    elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], (str, int, float)):
+        reply = str(result[0])
+    else:
+        # If result is dict or complex structure, try to find a top-level string field
+        if isinstance(result, dict):
+            for k in ("response", "reply", "data", "output"):
+                if k in result and isinstance(result[k], (str, int, float)):
+                    reply = str(result[k])
+                    break
 
-                if reply is None:
-                    return ChatResponse(reply=None, raw=data)
-                return ChatResponse(reply=reply, raw=data)
-
-            else:
-                body = r.text if r.text else "<no body>"
-                logger.warning("Space returned %s for %s: %s", r.status_code, url, body)
-                last_exc = r
-
-    if isinstance(last_exc, Exception):
-        raise HTTPException(status_code=502, detail=str(last_exc))
-    raise HTTPException(status_code=502, detail="Failed to call Space API; see server logs")
+    return ChatResponse(reply=reply, raw=raw_payload)
 
 # ---------------------------
 # If run directly (useful for local dev)
