@@ -1,28 +1,28 @@
-# app.py -- Render-ready proxy for a streaming HF Space (uses gradio_client.submit())
+# app.py -- Render-ready proxy for a streaming HF Space (robust to sync/async gradio_client versions)
 import os
 import logging
 import asyncio
 import time
 import traceback
-from typing import Optional, Any, Dict, Tuple, List
+import inspect
+from typing import Optional, Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ensure 'gradio_client' is listed in requirements.txt
 from gradio_client import Client  # type: ignore
 
 # -------- CONFIG & LOGGING --------
 HF_SPACE = os.getenv("HF_SPACE", "weboffice/imartllm-v1-gpt")
 HF_API_NAME = os.getenv("HF_API_NAME", "chat")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # must be set in Render env
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60.0"))  # seconds
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "http://localhost:5173").split(",")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
-RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))  # seconds
+RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("hf-space-proxy")
@@ -54,11 +54,6 @@ _gradio_client: Optional[Client] = None
 _gradio_client_meta: Dict[str, Any] = {"init_attempted": False, "kwarg_used": None, "error": None}
 
 def get_gradio_client() -> Client:
-    """
-    Construct gradio_client.Client robustly across versions.
-    Prefers 'token' or 'hf_token' kwarg if HF_API_TOKEN exists, else try no-token.
-    Stores diagnostic info in _gradio_client_meta.
-    """
     global _gradio_client, _gradio_client_meta
     if _gradio_client is not None:
         return _gradio_client
@@ -92,44 +87,36 @@ def get_gradio_client() -> Client:
         _gradio_client_meta["error"] = traceback.format_exc()
         raise
 
-# -------- HELPERS --------
-async def _wait_for_job_done(job, timeout: float) -> None:
+# -------- Helpers for sync/async callables --------
+async def _call_flexible(func, *args, **kwargs):
     """
-    Poll job.done() until true or timeout. Raises asyncio.TimeoutError on timeout.
-    `job` is the object returned from client.submit(...).
+    Call `func(*args, **kwargs)` in a way that supports:
+      - synchronous functions (call inside asyncio.to_thread)
+      - coroutine functions (await directly)
+    Also handles cases where a synchronous call returns a coroutine (await that).
     """
-    start = time.time()
-    while True:
-        # job.done() is synchronous; call it in thread
-        done = await asyncio.to_thread(getattr, job, "done")()
-        if done:
-            return
-        if time.time() - start > timeout:
-            raise asyncio.TimeoutError("Timeout waiting for job to finish")
-        await asyncio.sleep(0.1)
-
-async def _collect_job_outputs(job) -> List[Any]:
-    """
-    Collect outputs from the Job object.
-    Prefer job.outputs() then job.result() as fallback.
-    """
-    # Try outputs() first
     try:
-        outputs = await asyncio.to_thread(getattr(job, "outputs"))
-        return outputs if outputs is not None else []
+        if inspect.iscoroutinefunction(func):
+            # func is defined async def -> await
+            return await func(*args, **kwargs)
+        # call in thread so we don't block the event loop
+        res = await asyncio.to_thread(func, *args, **kwargs)
+        if asyncio.iscoroutine(res):
+            # the function returned a coroutine object (some libraries do that) -> await it
+            return await res
+        return res
     except Exception:
-        pass
-
-    # fallback to result()
-    try:
-        res = await asyncio.to_thread(getattr(job, "result"))
-        # if result is list-like, return; else wrap
-        if isinstance(res, list):
-            return res
-        return [res]
-    except Exception:
+        # re-raise so caller can handle/log
         raise
 
+async def _call_attr_flexible(obj, attr_name: str, *args, **kwargs):
+    """
+    Helper to call obj.attr_name(...) whether attr is sync or async (or returns coroutine).
+    """
+    attr = getattr(obj, attr_name)
+    return await _call_flexible(attr, *args, **kwargs)
+
+# extract reply
 def _extract_reply_from_result(result: Any) -> Optional[str]:
     reply = None
     if isinstance(result, (str, int, float)):
@@ -143,17 +130,16 @@ def _extract_reply_from_result(result: Any) -> Optional[str]:
                 break
     return reply
 
-# -------- HEALTH & DIAGNOSTICS --------
+# -------- Health & debug --------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 @app.get("/_debug/client-meta")
 async def client_meta():
-    # safe to reveal diagnostics (no tokens)
     return _gradio_client_meta
 
-# -------- CHAT endpoint (uses submit() + job.outputs() to support streaming) --------
+# -------- CHAT endpoint (robust) --------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     logger.info("Received /chat request: message_len=%d system_message_len=%d", len(req.message or ""), len(req.system_message or ""))
@@ -172,54 +158,72 @@ async def chat_endpoint(req: ChatRequest):
         req.top_p or 0.95,
     )
 
-    api_candidates = [f"/{HF_API_NAME.lstrip('/')}", HF_API_NAME.lstrip('/')]
+    # broaden candidate api names (leading slash variants and common names)
+    base_name = HF_API_NAME.lstrip("/")
+    api_candidates = []
+    for n in (HF_API_NAME, base_name, "/predict", "predict", "/run", "run", "/chat", "chat"):
+        if n not in api_candidates:
+            api_candidates.append(n)
+
     last_exc: Optional[Exception] = None
     final_result: Any = None
     api_used: Optional[str] = None
 
-    # Try a few times with backoff
+    # Try with retries/backoff
     for attempt in range(1, MAX_RETRIES + 2):
         for api_name_try in api_candidates:
             try:
                 logger.debug("Attempt %d: submitting job with api_name=%s", attempt, api_name_try)
-                # Use submit so generator/streaming endpoints work
-                job = await asyncio.to_thread(client.submit, *predict_args, api_name=api_name_try)
+                # Use flexible caller to support sync or async client.submit
+                job = await _call_flexible(client.submit, *predict_args, api_name=api_name_try)
                 api_used = api_name_try
 
-                # wait for completion (poll)
+                # wait for job to complete with timeout: use job.done() whether sync or async
                 try:
-                    await _wait_for_job_done(job, timeout=REQUEST_TIMEOUT)
+                    start = time.time()
+                    while True:
+                        # 'done' may be sync or async
+                        done = await _call_attr_flexible(job, "done")
+                        if done:
+                            break
+                        if time.time() - start > REQUEST_TIMEOUT:
+                            # try cancel if available
+                            try:
+                                await _call_attr_flexible(job, "cancel")
+                            except Exception:
+                                pass
+                            raise asyncio.TimeoutError("Timeout waiting for job to finish")
+                        await asyncio.sleep(0.1)
                 except asyncio.TimeoutError:
-                    # attempt to cancel job if cancellation exists
-                    try:
-                        await asyncio.to_thread(getattr(job, "cancel"))
-                    except Exception:
-                        pass
+                    logger.warning("Job timed out for api_name=%s (attempt=%d)", api_name_try, attempt)
                     raise
 
-                # collect outputs
-                outputs = await _collect_job_outputs(job)
+                # collect outputs (outputs() or result())
+                try:
+                    outputs = await _call_attr_flexible(job, "outputs")
+                except Exception:
+                    outputs = None
+
                 if outputs:
                     final_result = outputs[-1]
                 else:
-                    # as a last resort, try job.result()
-                    final_result = await asyncio.to_thread(getattr(job, "result"))
+                    final_result = await _call_attr_flexible(job, "result")
 
-                logger.info("Job completed with api_name=%s; attempt=%d", api_name_try, attempt)
-                break  # success -> break inner loop
+                logger.info("Job completed for api_name=%s on attempt %d", api_name_try, attempt)
+                break
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                last_exc = e
                 logger.warning("Predict job timed out for api_name=%s after %s seconds (attempt=%d)", api_name_try, REQUEST_TIMEOUT, attempt)
-                last_exc = asyncio.TimeoutError(f"timeout for api_name={api_name_try}")
             except Exception as e:
+                last_exc = e
+                # quiet common "not found" messages at INFO/WARN level but keep details in DEBUG
                 logger.warning("Submit/Job failed for api_name=%s on attempt %d: %s", api_name_try, attempt, e)
                 logger.debug(traceback.format_exc())
-                last_exc = e
 
         if final_result is not None:
             break
 
-        # backoff before next attempt (if another attempt remains)
         if attempt <= MAX_RETRIES:
             backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
             logger.info("Retrying after %.2fs backoff (attempt %d)", backoff, attempt + 1)
@@ -232,9 +236,7 @@ async def chat_endpoint(req: ChatRequest):
             detail["traceback"] = traceback.format_exc()
         raise HTTPException(status_code=502, detail=detail)
 
-    # extract reply
     reply = _extract_reply_from_result(final_result)
-
     raw_out = {
         "result": final_result,
         "client_meta": {"kwarg_used": _gradio_client_meta.get("kwarg_used"), "api_used": api_used}
