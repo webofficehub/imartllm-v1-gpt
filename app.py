@@ -1,34 +1,29 @@
-# app.py -- Render-ready proxy for a streaming HF Space (robust to sync/async gradio_client versions)
+# app.py -- Render proxy that POSTS directly to a Hugging Face Space /chat endpoint
 import os
 import logging
 import asyncio
-import time
+import httpx
 import traceback
-import inspect
 from typing import Optional, Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from gradio_client import Client  # type: ignore
-
-# -------- CONFIG & LOGGING --------
-HF_SPACE = os.getenv("HF_SPACE", "weboffice/imartllm-v1-gpt")
-HF_API_NAME = os.getenv("HF_API_NAME", "chat")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+# -------- Config & logging --------
+HF_SPACE_HOST = os.getenv("HF_SPACE_HOST", "https://weboffice-imartllm-v1-gpt.hf.space").rstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60.0"))
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "http://localhost:5173").split(",")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
+HF_API_TOKEN = os.getenv("HF_API_TOKEN", None)  # optional: include as Bearer header if needed
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("hf-space-proxy")
+logger = logging.getLogger("hf-space-proxy-http")
 
-# -------- APP --------
-app = FastAPI(title="HF Space Proxy")
+# -------- FastAPI app --------
+app = FastAPI(title="HF Space /chat HTTP proxy")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOW_ORIGINS],
@@ -37,9 +32,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- MODELS --------
+# -------- Models --------
 class ChatRequest(BaseModel):
     message: str
+    # optional history if you later want to pass conversation context
+    history: Optional[List[Dict[str, str]]] = None
     system_message: Optional[str] = "You are a friendly Chatbot."
     max_tokens: Optional[int] = 1024
     temperature: Optional[float] = 0.7
@@ -49,202 +46,124 @@ class ChatResponse(BaseModel):
     reply: Optional[str] = None
     raw: Optional[dict] = None
 
-# -------- gradio client singleton + diagnostics --------
-_gradio_client: Optional[Client] = None
-_gradio_client_meta: Dict[str, Any] = {"init_attempted": False, "kwarg_used": None, "error": None}
+# -------- Helpers --------
+def _build_payload(req: ChatRequest) -> dict:
+    """
+    Build the JSON body the Space expects for its /chat endpoint.
+    Matches the Gradio inputs order: [message, history, system_message, max_tokens, temperature, top_p]
+    """
+    history = req.history if req.history is not None else []
+    data = [req.message, history, req.system_message or "You are a friendly Chatbot.", req.max_tokens or 1024, req.temperature or 0.7, req.top_p or 0.95]
+    return {"data": data}
 
-def get_gradio_client() -> Client:
-    global _gradio_client, _gradio_client_meta
-    if _gradio_client is not None:
-        return _gradio_client
-
-    _gradio_client_meta["init_attempted"] = True
-    _gradio_client_meta["kwarg_used"] = None
-    _gradio_client_meta["error"] = None
-
+async def _post_chat(path: str, json_body: dict, timeout: float) -> httpx.Response:
+    headers = {"Content-Type": "application/json"}
+    # optionally include HF API token as Authorization if your Space is protected
     if HF_API_TOKEN:
-        for kw in ("token", "hf_token"):
+        headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+        return await client.post(path, json=json_body, headers=headers)
+
+def _extract_reply_from_space_json(j: dict) -> Optional[str]:
+    """
+    Gradio /predict-style responses normally return {"data": [<reply>, ...], ...}
+    For /chat top-level we expect similar shapes; be defensive.
+    """
+    if not isinstance(j, dict):
+        return None
+    # common: {"data": ["final reply", ...], ...}
+    if "data" in j and isinstance(j["data"], list) and len(j["data"]) > 0:
+        first = j["data"][0]
+        if isinstance(first, (str, int, float)):
+            return str(first)
+        # sometimes nested structures: {"data": [{"reply": "..."}]}
+        if isinstance(first, dict):
+            for k in ("reply", "response", "output", "text"):
+                if k in first and isinstance(first[k], (str, int, float)):
+                    return str(first[k])
+            # try stringify
             try:
-                logger.info("Attempting Client(%s, %s=...)", HF_SPACE, kw)
-                _gradio_client = Client(HF_SPACE, **{kw: HF_API_TOKEN})
-                _gradio_client_meta["kwarg_used"] = kw
-                logger.info("gradio_client created using %s", kw)
-                return _gradio_client
-            except TypeError as e:
-                logger.debug("%s kwarg not supported: %s", kw, e)
-            except Exception as e:
-                logger.warning("Unexpected error constructing Client with %s: %s", kw, e)
-                _gradio_client_meta["error"] = str(e)
-
-    try:
-        logger.info("Attempting Client(%s) without token", HF_SPACE)
-        _gradio_client = Client(HF_SPACE)
-        _gradio_client_meta["kwarg_used"] = "none"
-        logger.info("gradio_client created without token")
-        return _gradio_client
-    except Exception as e:
-        logger.exception("Failed to construct gradio_client.Client: %s", e)
-        _gradio_client_meta["error"] = traceback.format_exc()
-        raise
-
-# -------- Helpers for sync/async callables --------
-async def _call_flexible(func, *args, **kwargs):
-    """
-    Call `func(*args, **kwargs)` in a way that supports:
-      - synchronous functions (call inside asyncio.to_thread)
-      - coroutine functions (await directly)
-    Also handles cases where a synchronous call returns a coroutine (await that).
-    """
-    try:
-        if inspect.iscoroutinefunction(func):
-            # func is defined async def -> await
-            return await func(*args, **kwargs)
-        # call in thread so we don't block the event loop
-        res = await asyncio.to_thread(func, *args, **kwargs)
-        if asyncio.iscoroutine(res):
-            # the function returned a coroutine object (some libraries do that) -> await it
-            return await res
-        return res
-    except Exception:
-        # re-raise so caller can handle/log
-        raise
-
-async def _call_attr_flexible(obj, attr_name: str, *args, **kwargs):
-    """
-    Helper to call obj.attr_name(...) whether attr is sync or async (or returns coroutine).
-    """
-    attr = getattr(obj, attr_name)
-    return await _call_flexible(attr, *args, **kwargs)
-
-# extract reply
-def _extract_reply_from_result(result: Any) -> Optional[str]:
-    reply = None
-    if isinstance(result, (str, int, float)):
-        reply = str(result)
-    elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], (str, int, float)):
-        reply = str(result[0])
-    elif isinstance(result, dict):
-        for k in ("response", "reply", "data", "output", "result"):
-            if k in result and isinstance(result[k], (str, int, float)):
-                reply = str(result[k])
-                break
-    return reply
+                return str(first)
+            except Exception:
+                pass
+    # fallback: direct "detail" or "message"
+    for k in ("reply", "response", "result", "message", "detail"):
+        if k in j and isinstance(j[k], (str, int, float)):
+            return str(j[k])
+    return None
 
 # -------- Health & debug --------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "space_host": HF_SPACE_HOST}
 
-@app.get("/_debug/client-meta")
-async def client_meta():
-    return _gradio_client_meta
+@app.get("/_debug/config")
+async def debug_config():
+    return {"hf_space_host": HF_SPACE_HOST, "request_timeout": REQUEST_TIMEOUT, "max_retries": MAX_RETRIES, "kw_token": bool(HF_API_TOKEN)}
 
-# -------- CHAT endpoint (robust) --------
+# -------- Chat endpoint (calls HF Space /chat directly) --------
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
-    logger.info("Received /chat request: message_len=%d system_message_len=%d", len(req.message or ""), len(req.system_message or ""))
+    logger.info("Received /chat request: message_len=%d history_len=%d", len(req.message or ""), len(req.history or []))
+    json_body = _build_payload(req)
+    url = f"{HF_SPACE_HOST}/chat"  # you said the real endpoint is /chat
 
-    try:
-        client = get_gradio_client()
-    except Exception as e:
-        logger.exception("Failed to initialize gradio_client: %s", e)
-        raise HTTPException(status_code=500, detail="Server misconfiguration: failed to initialize gradio client")
+    last_exc = None
+    final_json = None
+    status_code = None
 
-    predict_args = (
-        req.message,
-        req.system_message or "You are a friendly Chatbot.",
-        req.max_tokens or 1024,
-        req.temperature or 0.7,
-        req.top_p or 0.95,
-    )
-
-    # broaden candidate api names (leading slash variants and common names)
-    base_name = HF_API_NAME.lstrip("/")
-    api_candidates = []
-    for n in (HF_API_NAME, base_name, "/predict", "predict", "/run", "run", "/chat", "chat"):
-        if n not in api_candidates:
-            api_candidates.append(n)
-
-    last_exc: Optional[Exception] = None
-    final_result: Any = None
-    api_used: Optional[str] = None
-
-    # Try with retries/backoff
     for attempt in range(1, MAX_RETRIES + 2):
-        for api_name_try in api_candidates:
-            try:
-                logger.debug("Attempt %d: submitting job with api_name=%s", attempt, api_name_try)
-                # Use flexible caller to support sync or async client.submit
-                job = await _call_flexible(client.submit, *predict_args, api_name=api_name_try)
-                api_used = api_name_try
+        try:
+            logger.debug("POSTing to HF Space %s (attempt %d)", url, attempt)
+            resp = await _post_chat(url, json_body, timeout=REQUEST_TIMEOUT)
+            status_code = resp.status_code
+            text = resp.text
+            logger.debug("HF response HTTP %d (len=%d)", status_code, len(text or ""))
 
-                # wait for job to complete with timeout: use job.done() whether sync or async
+            if resp.status_code != 200:
+                # try to parse JSON error detail if available
                 try:
-                    start = time.time()
-                    while True:
-                        # 'done' may be sync or async
-                        done = await _call_attr_flexible(job, "done")
-                        if done:
-                            break
-                        if time.time() - start > REQUEST_TIMEOUT:
-                            # try cancel if available
-                            try:
-                                await _call_attr_flexible(job, "cancel")
-                            except Exception:
-                                pass
-                            raise asyncio.TimeoutError("Timeout waiting for job to finish")
-                        await asyncio.sleep(0.1)
-                except asyncio.TimeoutError:
-                    logger.warning("Job timed out for api_name=%s (attempt=%d)", api_name_try, attempt)
-                    raise
-
-                # collect outputs (outputs() or result())
-                try:
-                    outputs = await _call_attr_flexible(job, "outputs")
+                    err_j = resp.json()
+                    logger.warning("HF Space returned non-200: %s", err_j)
+                    last_exc = HTTPException(status_code=502, detail={"error": "upstream-non-200", "status": resp.status_code, "body": err_j})
                 except Exception:
-                    outputs = None
+                    last_exc = HTTPException(status_code=502, detail={"error": "upstream-non-200", "status": resp.status_code, "body": resp.text})
+                raise last_exc
 
-                if outputs:
-                    final_result = outputs[-1]
-                else:
-                    final_result = await _call_attr_flexible(job, "result")
-
-                logger.info("Job completed for api_name=%s on attempt %d", api_name_try, attempt)
-                break
-
-            except asyncio.TimeoutError as e:
-                last_exc = e
-                logger.warning("Predict job timed out for api_name=%s after %s seconds (attempt=%d)", api_name_try, REQUEST_TIMEOUT, attempt)
+            # parse JSON
+            try:
+                j = resp.json()
             except Exception as e:
+                logger.exception("Failed to parse JSON from HF Space: %s", e)
                 last_exc = e
-                # quiet common "not found" messages at INFO/WARN level but keep details in DEBUG
-                logger.warning("Submit/Job failed for api_name=%s on attempt %d: %s", api_name_try, attempt, e)
-                logger.debug(traceback.format_exc())
+                raise HTTPException(status_code=502, detail={"error": "invalid-upstream-json", "body": resp.text})
 
-        if final_result is not None:
+            final_json = j
             break
 
-        if attempt <= MAX_RETRIES:
-            backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
-            logger.info("Retrying after %.2fs backoff (attempt %d)", backoff, attempt + 1)
-            await asyncio.sleep(backoff)
+        except Exception as e:
+            last_exc = e
+            logger.warning("Attempt %d failed: %s", attempt, str(e))
+            # backoff if we will retry
+            if attempt <= MAX_RETRIES:
+                backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.info("Retrying after %.2fs backoff (attempt %d)", backoff, attempt + 1)
+                await asyncio.sleep(backoff)
+            else:
+                logger.exception("All attempts failed; last exception: %s", e)
 
-    if final_result is None:
-        logger.exception("All predict attempts failed after retries")
-        detail = {"error": "upstream-predict-failed", "client_meta": {"kwarg_used": _gradio_client_meta.get("kwarg_used"), "api_used": api_used}}
-        if LOG_LEVEL == "DEBUG" and last_exc is not None:
+    if final_json is None:
+        # return a helpful 502 with last error details
+        detail = {"error": "upstream-unavailable", "last_exception": str(last_exc)}
+        if LOG_LEVEL == "DEBUG":
             detail["traceback"] = traceback.format_exc()
         raise HTTPException(status_code=502, detail=detail)
 
-    reply = _extract_reply_from_result(final_result)
-    raw_out = {
-        "result": final_result,
-        "client_meta": {"kwarg_used": _gradio_client_meta.get("kwarg_used"), "api_used": api_used}
-    }
-
+    reply = _extract_reply_from_space_json(final_json)
+    raw_out = {"upstream_status": status_code, "upstream_json": final_json}
     return ChatResponse(reply=reply, raw=raw_out)
 
-# -------- LOCAL DEV RUNNER --------
+# -------- Local dev runner --------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), log_level=LOG_LEVEL.lower())
