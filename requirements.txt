@@ -3,4 +3,4 @@ uvicorn[standard]
 httpx
 pydantic
 gradio_client>=0.4.0
-
+requests
